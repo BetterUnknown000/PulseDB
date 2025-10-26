@@ -16,7 +16,10 @@ def _need(mod, pip_name=None):
 _need("numpy")
 _need("scipy")
 _need("matplotlib")
+_need("h5py")
 
+
+import h5py
 import numpy as np
 from scipy.io import loadmat
 import matplotlib
@@ -77,44 +80,96 @@ def _autofind_mat(data_dir=DEFAULT_DATA_DIR):
     mats.sort()
     return os.path.abspath(mats[0])
 
+def _h5_list_numeric_datasets(h5file):
+    """Return list of (path, dataset) for numeric HDF5 datasets."""
+    out = []
+    def _visit(name, obj):
+        import numpy as np
+        import h5py
+        if isinstance(obj, h5py.Dataset) and np.issubdtype(obj.dtype, np.number):
+            out.append((name, obj))
+    h5file.visititems(_visit)
+    return out
+
+
+def _load_mat_hdf5(mat_path, want=None):
+    """Load a MATLAB v7.3 .mat (HDF5) file and return (X, key)."""
+    import numpy as np, h5py
+    with h5py.File(mat_path, "r") as f:
+        ds_list = _h5_list_numeric_datasets(f)
+        if not ds_list:
+            raise ValueError("No numeric datasets found in file.")
+        # choose signal
+        target = None
+        if want:
+            wl = want.lower()
+            for name, ds in ds_list:
+                if wl in name.lower():
+                    target = (name, ds); break
+        if target is None:
+            for sig in ("ppg","ecg","abp"):
+                for name, ds in ds_list:
+                    if sig in name.lower():
+                        target = (name, ds); break
+                if target: break
+        if target is None:
+            target = ds_list[0]
+        name, ds = target
+        arr = np.array(ds[()])
+        arr = np.squeeze(arr)
+        try:
+            X = _to2d(arr)
+        except Exception:
+            if arr.ndim == 3 and 1 in arr.shape:
+                arr = np.squeeze(arr)
+            if arr.ndim == 2:
+                X = _to2d(arr)
+            elif arr.ndim == 1:
+                X = arr[None, :]
+            else:
+                n = arr.shape[0]
+                X = arr.reshape(n, -1)
+        return X, name
 
 def load_mat(mat_path, want=None):
-    d = loadmat(mat_path)
-    keys = [k for k in d if not k.startswith("__")]
-    print("[mat] found keys:", ", ".join(keys))
+    """Loads MATLAB file. Auto-detects v7.3 (HDF5) files and falls back to h5py."""
+    try:
+        d = loadmat(mat_path)
+        keys = [k for k in d if not k.startswith("__")]
+        print("[mat] found keys:", ", ".join(keys))
 
-    def fuzzy_find(candidates):
-        lookup = {k.lower(): k for k in keys}
-        for c in candidates:
-            if c in lookup:
-                return lookup[c]
-        for k in keys:
-            if any(c in k.lower() for c in candidates):
-                return k
-        return None
+        def fuzzy_find(candidates):
+            lookup = {k.lower(): k for k in keys}
+            for c in candidates:
+                if c in lookup: return lookup[c]
+            for k in keys:
+                if any(c in k.lower() for c in candidates):
+                    return k
+            return None
 
-    target_key = fuzzy_find([want.lower()]) if want else fuzzy_find(["ppg", "ecg", "abp"])
-
-    if not target_key:
-        for k in keys:
-            try:
-                _ = _to2d(d[k])
-                target_key = k
-                break
-            except: pass
+        target_key = fuzzy_find([want.lower()]) if want else fuzzy_find(["ppg", "ecg", "abp"])
         if not target_key:
-            raise KeyError(f"Couldn't locate usable signal in: {keys}")
+            for k in keys:
+                try:
+                    _ = _to2d(d[k]); target_key = k; break
+                except: pass
+            if not target_key:
+                raise KeyError(f"Couldn't locate usable signal in: {keys}")
 
-    sig_data = _to2d(d[target_key])
-    print("[mat] using:", target_key)
-    print("[mat] shape:", sig_data.shape)
+        sig_data = _to2d(d[target_key])
+        print("[mat] using:", target_key)
+        print("[mat] shape:", sig_data.shape)
+        sig_data = np.where(np.isfinite(sig_data), sig_data, 0.0)
+        return sig_data, target_key
 
-    if not np.isfinite(sig_data).any():
-        raise ValueError("All signal values are non-finite")
-
-    sig_data = np.where(np.isfinite(sig_data), sig_data, 0.0)
-    return sig_data, target_key
-
+    except NotImplementedError:
+        # v7.3 (HDF5) fallback
+        print("[mat] Detected MATLAB v7.3 (HDF5). Using h5py...")
+        X, key = _load_mat_hdf5(mat_path, want)
+        print("[mat] using:", key)
+        print("[mat] shape:", X.shape)
+        X = np.where(np.isfinite(X), X, 0.0)
+        return X, key
 
 def make_demo(n=120, L=400, seed=0):
     rng = np.random.default_rng(seed)
