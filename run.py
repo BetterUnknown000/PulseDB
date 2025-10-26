@@ -47,12 +47,12 @@ def main():
             leaf_report.append({
                 "cluster_id": clust_id,
                 "size": len(indices),
-                "closest_pair_ids": "",          # nothing to compare
+                "closest_pair_ids": "",  # nothing to compare
                 "min_distance": float("inf"),
-        })
-        continue
+            })
+            continue  # <-- stays inside the if-block
 
-        # compute closest pair **inside** the loop for this leaf
+        # compute closest pair for this leaf
         dmin, (i1, i2) = closest_pair_bruteforce(signals[indices])
         leaf_report.append({
             "cluster_id": clust_id,
@@ -60,7 +60,6 @@ def main():
             "closest_pair_ids": f"{sample_ids[indices[i1]]},{sample_ids[indices[i2]]}",
             "min_distance": float(dmin),
         })
-
 
     # Kadane analysis across each signal
     kad_summary = []
