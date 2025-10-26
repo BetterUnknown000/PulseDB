@@ -39,25 +39,27 @@ def main():
     clusterer = DivideAndConquerClustering(min_size=args.min_size)
     cluster_tree = clusterer.fit(signals)
 
+    # Build per-leaf report (size + closest pair)
     leaf_report = []
     for clust_id, indices in cluster_tree["leaves"].items():
-      if len(indices) < 2:
-        leaf_report.append({
-            "cluster_id": clust_id,
-            "size": len(indices),
-            "closest_pair_ids": "",           # nothing to compare
-            "min_distance": float("inf"),
+        indices = list(indices)
+        if len(indices) < 2:
+            leaf_report.append({
+                "cluster_id": clust_id,
+                "size": len(indices),
+                "closest_pair_ids": "",          # nothing to compare
+                "min_distance": float("inf"),
         })
         continue
 
-    dist_min, close_pair = closest_pair_bruteforce(signals[indices])
-    i1, i2 = close_pair
-    leaf_report.append({
-        "cluster_id": clust_id,
-        "size": len(indices),
-        "closest_pair_ids": f"{sample_ids[indices[i1]]},{sample_ids[indices[i2]]}",
-        "min_distance": float(dist_min)
-    })
+        # compute closest pair **inside** the loop for this leaf
+        dmin, (i1, i2) = closest_pair_bruteforce(signals[indices])
+        leaf_report.append({
+            "cluster_id": clust_id,
+            "size": len(indices),
+            "closest_pair_ids": f"{sample_ids[indices[i1]]},{sample_ids[indices[i2]]}",
+            "min_distance": float(dmin),
+        })
 
 
     # Kadane analysis across each signal
