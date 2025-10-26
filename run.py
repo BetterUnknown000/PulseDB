@@ -1,210 +1,288 @@
 # run.py
-# --------------------------------------------------
-# Quick launcher for CMPSC-463 clustering project
-# --------------------------------------------------
-# USAGE:
-#   Demo mode (fake data, no .mat needed):
-#       python run.py
-#       python run.py --demo
-#
-#   With real dataset (.mat format):
-#       python run.py --mat path/to/file.mat
-#       # optionally: --signal ECG|PPG|ABP to override key detection
-#
-# OUTPUTS:
-#   out/summary.csv
-#   out/cluster_examples.png
-#   out/tree.json
-# --------------------------------------------------
+import argparse, os, sys, json, csv, math, random
 
-import argparse
-import os
-import json
-import sys
-
-# -- quick and dirty import checker, no fancy installers here
-def check_requirements(mod, pip_name=None):
+def _need(mod, pipname=None):
     try:
         __import__(mod)
-    except Exception as err:
-        print(f"\n[ERROR] Missing required package: {pip_name or mod}")
-        print(f"Install it manually with: pip install {pip_name or mod}")
-        print(f"(Details: {err})\n")
+    except Exception as e:
+        pkg = pipname or mod
+        print(f"[error] missing '{pkg}'. install with: pip install {pkg}\n{e}")
         sys.exit(1)
 
-check_requirements("numpy")
-check_requirements("scipy")
-check_requirements("matplotlib")
-
-# -- imports after confirming deps
+_need("numpy"); _need("scipy"); _need("matplotlib")
 import numpy as np
 from scipy.io import loadmat
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# -- project-specific bits
-from src.data_io import load_pulsedb_mat, make_demo
-from src.clustering import DivideAndConquerClustering
-from src.algorithms import closest_pair_bruteforce, kadane
-from src.reporting import save_summary, plot_clusters_quick
-
-# -----------------------------------
-# Helper to auto-guess signal type
-# -----------------------------------
-def guess_signal_key(matfile_path: str) -> str | None:
-    """
-    Try to infer which signal to use (ECG, PPG, etc.) from the .mat file.
-    This tries both top-level keys and single-level nested dicts.
-    """
-    print(f"[guess] Looking inside {matfile_path} for signal data…")
-    mat_data = loadmat(matfile_path, squeeze_me=True, simplify_cells=True)
-
-    def usable_keys(d):
-        return [k for k in d if not k.startswith("__")]
-
-    priority_signals = ["PPG", "ECG", "ABP"]
-    alt_names = [s.lower() for s in priority_signals]
-
-    # Try top-level keys first
-    for key in usable_keys(mat_data):
-        if key in priority_signals or key.lower() in alt_names:
-            print(f"[guess] Found signal at top level: '{key}'")
-            return key
-
-    # Try one level deeper
-    for key in usable_keys(mat_data):
-        val = mat_data[key]
-        if isinstance(val, dict):
-            for subkey in val:
-                if subkey in priority_signals or subkey.lower() in alt_names:
-                    print(f"[guess] Found nested signal under '{key}': '{subkey}'")
-                    return subkey
-
-    # Last resort: find something array-ish
-    for key in usable_keys(mat_data):
-        val = mat_data[key]
-        try:
-            arr = np.asarray(val)
-            if arr.size > 0 and arr.ndim in (1, 2):  # keeping it simple
-                print(f"[guess] Using fallback key: '{key}' (looks like data)")
-                return key
-        except Exception:
+# ---------------- data io ----------------
+def _stack_equal(seqs):
+    xs = []
+    for s in seqs:
+        if s is None: 
             continue
+        a = np.asarray(s, dtype=float).ravel()
+        if a.size > 0 and np.isfinite(a).any():
+            xs.append(a)
+    if not xs:
+        raise ValueError("no usable segments")
+    L = min(len(a) for a in xs)
+    return np.vstack([a[:L] for a in xs])
 
-    print("[guess] No valid signal found.")
-    return None
+def _to2d(x):
+    if isinstance(x, (list, tuple)):
+        return _stack_equal(x)
+    a = np.asarray(x, dtype=float)
+    if a.dtype == object:
+        return _stack_equal([np.asarray(t, dtype=float).ravel() for t in a.ravel().tolist()])
+    if a.ndim == 1: 
+        return a[None, :]
+    if a.ndim == 2: 
+        return a
+    raise ValueError("cannot coerce to 2d")
 
-# quick mkdir helper
-def ensure_out_folder(path: str) -> str:
-    if not os.path.exists(path):
-        os.makedirs(path)
-    return path
+def load_mat(mat_path, want=None):
+    if not os.path.isfile(mat_path):
+        raise FileNotFoundError(mat_path)
+    d = loadmat(mat_path)
+    keys = [k for k in d.keys() if not k.startswith("__")]
+    print("[mat] keys:", ", ".join(keys))
 
+    def pick(cands):
+        low = {k.lower(): k for k in keys}
+        for c in cands:
+            if c in low: 
+                return low[c]
+        for k in keys:
+            if any(c in k.lower() for c in cands):
+                return k
+        return None
 
-# -------------------------------------------------
-# Main function — this is where everything kicks off
-# -------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Run clustering + Kadane’s on input signals.")
-    parser.add_argument("--mat", type=str, default="", help="Path to .mat file. If not set, demo is used.")
-    parser.add_argument("--signal", type=str, default="AUTO", help="Signal key to use (ECG, PPG, etc.)")
-    parser.add_argument("--n", type=int, default=200, help="Max number of segments to process.")
-    parser.add_argument("--out", type=str, default="out", help="Output directory.")
-    parser.add_argument("--min_size", type=int, default=25, help="Minimum cluster size for leaf nodes.")
-    parser.add_argument("--max_depth", type=int, default=None, help="Optional max tree depth.")
-    parser.add_argument("--demo", action="store_true", help="Force demo mode regardless of --mat.")
-
-    args = parser.parse_args()
-
-    out_path = ensure_out_folder(args.out)
-
-    # ---- Load Data ----
-    if args.demo or not args.mat:
-        print("[data] Demo mode ON — generating synthetic signals")
-        ids, X = make_demo(n=min(max(args.n, 1), 10000), length=500)
+    if want:
+        k = pick([want.lower()])
+        if k is None:
+            raise KeyError(f"signal '{want}' not found; available: {keys}")
     else:
-        signal_key = args.signal
-        if signal_key.upper() == "AUTO":
-            signal_key = guess_signal_key(args.mat) or "PPG"  # fallback to PPG
-            print(f"[data] Signal auto-selected: {signal_key}")
+        k = pick(["ppg","ecg","abp"])
+        if k is None:
+            # fallback: first coercible numeric thing
+            for kk in keys:
+                try:
+                    _ = _to2d(d[kk])
+                    k = kk; break
+                except Exception:
+                    pass
+            if k is None:
+                raise KeyError(f"no numeric signal key detected; available: {keys}")
 
-        print(f"[data] Loading data from {args.mat} (signal={signal_key}) …")
-        try:
-            ids, X = load_pulsedb_mat(args.mat, signal_type=signal_key, limit=args.n)
-        except Exception as err:
-            print(f"[warn] Problem reading '{signal_key}' from .mat: {err}")
-            print("[warn] Reverting to demo mode instead.")
-            ids, X = make_demo(n=min(max(args.n, 1), 10000), length=500)
+    X = _to2d(d[k])
+    print("[mat] selected:", k)
+    print("[mat] raw shape:", X.shape)
+    if not np.isfinite(X).any():
+        raise ValueError("all values are non-finite")
+    X = np.where(np.isfinite(X), X, 0.0)
+    return X, k
 
-    # Enforce string IDs
-    ids = [str(i) for i in ids]
-    X = np.asarray(X, dtype=float)
-    num_samples, signal_len = X.shape
-    print(f"[data] Loaded {num_samples} samples, each of length {signal_len}")
+def make_demo(n=120, L=400, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 6*np.pi, L)
+    xs = []
+    for i in range(n):
+        z = 0.2 * rng.standard_normal(L)
+        if i % 3 == 0: s = np.sin(t) + z
+        elif i % 3 == 1: s = np.sin(2*t+0.5) + 0.5*np.cos(0.5*t) + z
+        else: s = np.sign(np.sin(0.8*t)) + 0.3*np.sin(3*t) + z
+        xs.append(s)
+    return np.vstack(xs), "DEMO"
 
-    # ---- Run Clustering ----
-    print(f"[cluster] Starting D&C clustering (min_size={args.min_size}) …")
-    dac = DivideAndConquerClustering(min_size=args.min_size, max_depth=args.max_depth)
-    cluster_tree = dac.fit(X)
+# ---------------- algorithms ----------------
+def znorm(x):
+    x = np.asarray(x, dtype=float)
+    m, s = x.mean(), x.std()
+    if s == 0 or not np.isfinite(s): 
+        return x - m
+    return (x - m) / (s + 1e-8)
 
-    # Save the tree
-    tree_file = os.path.join(out_path, "tree.json")
-    try:
-        with open(tree_file, "w") as f:
-            json.dump(cluster_tree, f)
-        print(f"[save] Cluster tree saved to: {tree_file}")
-    except Exception as err:
-        print(f"[warn] Could not write cluster tree: {err}")
+def corr_dist(a, b):
+    a = znorm(a); b = znorm(b)
+    num = float(np.dot(a, b))
+    den = float(np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+    return 1.0 - (num / den)
 
-    # ---- Closest Pair in Each Leaf ----
-    closest_results = []
-    for cl_id, idx_list in cluster_tree["leaves"].items():
-        members = list(idx_list)
-        if len(members) < 2:
-            closest_results.append({
-                "cluster_id": cl_id,
-                "size": len(members),
-                "closest_pair_ids": "",
-                "min_distance": float("inf"),
-            })
-            continue
+def kadane(x):
+    best, cur = -float("inf"), 0.0
+    L = R = l = 0
+    for r, v in enumerate(x):
+        v = float(v)
+        if cur <= 0:
+            cur, l = v, r
+        else:
+            cur += v
+        if cur > best:
+            best, L, R = cur, l, r+1
+    return L, R, best
 
-        dist, (a, b) = closest_pair_bruteforce(X[members])
-        closest_results.append({
-            "cluster_id": cl_id,
-            "size": len(members),
-            "closest_pair_ids": f"{ids[members[a]]},{ids[members[b]]}",
+def closest_pair_bruteforce(X, idxs):
+    idxs = np.asarray(idxs, dtype=int)
+    if len(idxs) < 2:
+        return (int(idxs[0]), int(idxs[0])), float("inf")
+    best = (None, None); bd = float("inf")
+    for i in range(len(idxs)):
+        for j in range(i+1, len(idxs)):
+            d = corr_dist(X[idxs[i]], X[idxs[j]])
+            if d < bd: bd, best = d, (int(idxs[i]), int(idxs[j]))
+    return best, bd
+
+# ---------------- clustering ----------------
+class DAC:
+    def __init__(self, min_size=25, max_depth=None, k=16, seed=0):
+        self.min = int(min_size)
+        self.maxd = max_depth
+        self.k = int(k)
+        self.rng = random.Random(seed)
+        self.leaves = {}
+
+    def fit(self, X):
+        idxs = np.arange(X.shape[0])
+        root = self._build(X, idxs, 0, 0)
+        return {"root": root, "leaves": self.leaves}
+
+    def _pick2(self, X, idxs):
+        s0 = self.rng.choice(list(idxs))
+        sample = self.rng.sample(list(idxs), min(self.k, len(idxs)))
+        s1 = max(((corr_dist(X[s0], X[j]), j) for j in sample))[1]
+        return s0, s1
+
+    def _split(self, X, idxs):
+        if len(idxs) < 2: 
+            return idxs, np.array([], dtype=int)
+        a, b = self._pick2(X, idxs)
+        L, R = [], []
+        for j in idxs:
+            da = corr_dist(X[j], X[a])
+            db = corr_dist(X[j], X[b])
+            (L if da <= db else R).append(j)
+        return np.asarray(L, int), np.asarray(R, int)
+
+    def _build(self, X, idxs, depth, nid):
+        node = {"id": int(nid), "size": int(len(idxs)), "children": []}
+        stop = len(idxs) <= self.min or (self.maxd is not None and depth >= self.maxd)
+        if stop:
+            self.leaves[nid] = {"idxs": np.array(idxs, int)}
+            node["leaf"] = True
+            return node
+        L, R = self._split(X, idxs)
+        if len(L) == 0 or len(R) == 0:
+            self.leaves[nid] = {"idxs": np.array(idxs, int)}
+            node["leaf"] = True
+            return node
+        node["leaf"] = False
+        node["children"].append(self._build(X, L, depth+1, nid*2+1))
+        node["children"].append(self._build(X, R, depth+1, nid*2+2))
+        return node
+
+# ---------------- reporting ----------------
+def write_summary(leaf_rows, kad_rows, path_csv):
+    os.makedirs(os.path.dirname(path_csv), exist_ok=True)
+    with open(path_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["# Cluster summary"])
+        w.writerow(["cluster_id","size","closest_pair_ids","min_distance"])
+        for r in leaf_rows:
+            w.writerow([r["cluster_id"], r["size"], r["closest_pair_ids"], f"{r['min_distance']:.6f}"])
+        w.writerow([])
+        w.writerow(["# Kadane per segment"])
+        w.writerow(["id","kadane_start","kadane_end","kadane_sum"])
+        for r in kad_rows:
+            w.writerow([r["id"], r["kadane_start"], r["kadane_end"], f"{r['kadane_sum']:.6f}"])
+
+def plot_means(X, leaves, path_png, top=6):
+    os.makedirs(os.path.dirname(path_png), exist_ok=True)
+    order = sorted(leaves.keys(), key=lambda nid: len(leaves[nid]["idxs"]), reverse=True)[:top]
+    plt.figure(figsize=(10,6))
+    for nid in order:
+        idxs = leaves[nid]["idxs"]
+        m = X[idxs].mean(axis=0)
+        plt.plot(m, label=f"leaf {nid} (n={len(idxs)})")
+    plt.title("Cluster mean signals")
+    plt.xlabel("time"); plt.ylabel("amplitude (z-norm)")
+    plt.legend(); plt.tight_layout(); plt.savefig(path_png, dpi=150); plt.close()
+
+# ---------------- main ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mat", type=str, default="", help="path to .mat (Announcement #1)")
+    ap.add_argument("--signal", type=str, default="", help="PPG|ECG|ABP (optional)")
+    ap.add_argument("--n", type=int, default=1000, help="max segments")
+    ap.add_argument("--out", type=str, default="out/", help="output folder")
+    ap.add_argument("--min_size", type=int, default=25, help="leaf size")
+    ap.add_argument("--max_depth", type=int, default=None, help="depth cap")
+    ap.add_argument("--demo", action="store_true", help="toy data")
+    args = ap.parse_args()
+
+    if not args.demo and not args.mat:
+        print("[usage] provide --mat <file> or use --demo")
+        sys.exit(2)
+
+    os.makedirs(args.out, exist_ok=True)
+
+    # load
+    if args.demo:
+        Xraw, sig = make_demo()
+    else:
+        Xraw, sig = load_mat(args.mat, args.signal.strip() or None)
+
+    # shape checks
+    if Xraw.ndim != 2:
+        raise ValueError(f"expected 2d, got {Xraw.ndim}d")
+    n, L = Xraw.shape
+    if n < 2 or L < 16:
+        raise ValueError(f"not enough data: (n,L)=({n},{L})")
+    print("[sample] first segment (first 5):", np.asarray(Xraw[0][:5]).round(3).tolist())
+
+    # limit n, z-norm
+    if args.n and n > args.n:
+        Xraw = Xraw[:args.n]
+        n = Xraw.shape[0]
+    X = np.vstack([znorm(x) for x in Xraw])
+    print("[data] final shape (n, L):", X.shape)
+
+    # cluster
+    dac = DAC(min_size=args.min_size, max_depth=args.max_depth, seed=0)
+    tree = dac.fit(X)
+    print("[cluster] leaves:", len(tree["leaves"]))
+
+    # leaf info
+    leaf_rows = []
+    for nid, meta in tree["leaves"].items():
+        idxs = meta["idxs"]
+        pair, dist = closest_pair_bruteforce(X, idxs)
+        leaf_rows.append({
+            "cluster_id": int(nid),
+            "size": int(len(idxs)),
+            "closest_pair_ids": f"{pair[0]}-{pair[1]}",
             "min_distance": float(dist),
         })
 
-    # ---- Kadane’s Algorithm Segment ----
-    kad_results = []
-    for i in range(num_samples):
-        start, end, max_sum = kadane(X[i])
-        kad_results.append({
-            "id": ids[i],
-            "kadane_start": start,
-            "kadane_end": end,
-            "kadane_sum": max_sum,
-        })
+    # kadane per segment
+    kad_rows = []
+    for gid in range(X.shape[0]):
+        l, r, s = kadane(X[gid])
+        kad_rows.append({"id": int(gid), "kadane_start": int(l), "kadane_end": int(r), "kadane_sum": float(s)})
 
-    # ---- Write Summary CSV ----
-    csv_output = os.path.join(out_path, "summary.csv")
-    try:
-        save_summary(closest_results, kad_results, csv_output)
-        print(f"[save] Summary written to: {csv_output}")
-    except Exception as err:
-        print(f"[warn] Could not write summary CSV: {err}")
+    # outputs
+    out_csv = os.path.join(args.out, "summary.csv")
+    out_png = os.path.join(args.out, "cluster_examples.png")
+    out_json = os.path.join(args.out, "tree.json")
 
-    # ---- Plot Cluster Snapshots ----
-    img_output = os.path.join(out_path, "cluster_examples.png")
-    try:
-        plot_clusters_quick(X, cluster_tree, img_output)
-        print(f"[save] Cluster plot saved as: {img_output}")
-    except Exception as err:
-        print(f"[warn] Plotting failed: {err}")
-        # print("[debug] Might be matplotlib backend issue?")
+    write_summary(leaf_rows, kad_rows, out_csv)
+    plot_means(X, tree["leaves"], out_png)
+    with open(out_json, "w") as f: json.dump(tree, f, indent=2)
 
-    print(f"\n[done] All outputs saved in: {out_path}")
-
+    print("[ok] wrote", out_csv)
+    print("[ok] wrote", out_png)
+    print("[ok] wrote", out_json)
 
 if __name__ == "__main__":
     main()
